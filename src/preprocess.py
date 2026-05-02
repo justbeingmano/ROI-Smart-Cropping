@@ -187,7 +187,7 @@ def main():
     # Configuration
     BASE_PATH = Path("project-image/VOC2012_train_val/VOC2012_train_val")
     OUTPUT_PATH = Path("output/preprocessed_50")
-    SAMPLE_SIZE = 50
+    SAMPLE_SIZE = 500
     SPLIT_FILE = "val.txt"  # Use 'val.txt' for small test; 'train.txt' for full
     
     print(f"[INFO] Loading data from: {BASE_PATH}")
