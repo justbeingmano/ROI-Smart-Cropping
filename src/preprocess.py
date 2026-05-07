@@ -5,6 +5,15 @@ import yaml
 from pathlib import Path
 from tqdm import tqdm
 
+# VOC2012 Classes Mapping (Index -> Name)
+# Note: Index 0 is background in VOC masks, so we shift indices by -1 for YOLO (0-19)
+VOC_CLASSES = [
+    'aeroplane', 'bicycle', 'bird', 'boat', 'bottle',
+    'bus', 'car', 'cat', 'chair', 'cow',
+    'diningtable', 'dog', 'horse', 'motorbike', 'person',
+    'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor'
+]
+
 def preprocess_image(img: np.ndarray, target_size=(640, 640)) -> np.ndarray:
     img_resized = cv2.resize(img, target_size, interpolation=cv2.INTER_LINEAR)
     lab = cv2.cvtColor(img_resized, cv2.COLOR_BGR2LAB)
@@ -20,19 +29,18 @@ def mask_to_yolo_polygons(mask: np.ndarray, img_w: int, img_h: int) -> list[str]
         mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
     
     unique_labels = np.unique(mask)
-    unique_labels = unique_labels[unique_labels != 0]  # Skip background
+    # Exclude background (0) and void (255)
+    unique_labels = unique_labels[(unique_labels != 0) & (unique_labels != 255)]
     
     lines = []
     for label in unique_labels:
-        # Create binary mask: 255 for object, 0 for background
-        # Ensure it's uint8 and single channel
+        # Create binary mask for this specific instance/class
         binary = ((mask == label) * 255).astype(np.uint8)
         
-        # Find contours
         try:
             contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        except Exception as e:
-            continue # Skip if contour finding fails
+        except Exception:
+            continue
             
         if not contours: 
             continue
@@ -45,9 +53,14 @@ def mask_to_yolo_polygons(mask: np.ndarray, img_w: int, img_h: int) -> list[str]
         pts[:, 0] /= img_w
         pts[:, 1] /= img_h
         
-        class_id = 0 # Single class for now
-        coords = " ".join(f"{p[0]:.6f} {p[1]:.6f}" for p in pts)
-        lines.append(f"{class_id} {coords}")
+        # IMPORTANT: VOC labels start from 1. YOLO expects 0-indexed classes.
+        # So we subtract 1. If label is 1 (aeroplane), class_id becomes 0.
+        class_id = int(label) - 1
+        
+        # Safety check: ensure class_id is within 0-19 range
+        if 0 <= class_id < 20:
+            coords = " ".join(f"{p[0]:.6f} {p[1]:.6f}" for p in pts)
+            lines.append(f"{class_id} {coords}")
         
     return lines
 
@@ -63,7 +76,6 @@ def process_split(split_name: str, base_path: Path, output_path: Path, target_si
     img_dir = base_path / 'JPEGImages'
     mask_dir = base_path / 'SegmentationObject'
     
-    # Create split-specific directories
     out_img = output_path / 'images' / split_name
     out_mask = output_path / 'masks' / split_name
     out_lbl = output_path / 'labels' / split_name
@@ -79,23 +91,17 @@ def process_split(split_name: str, base_path: Path, output_path: Path, target_si
             continue
         
         img = cv2.imread(str(img_path))
-        # Read mask as unchanged to keep instance IDs, but handle 3-channel case later
         mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
         
         if img is None or mask is None: 
             continue
         
-        # Preprocess image
         img_out = preprocess_image(img, target_size)
-        
-        # Resize mask with nearest-neighbor to preserve integer labels
         mask_out = cv2.resize(mask, target_size, interpolation=cv2.INTER_NEAREST)
         
-        # Save processed image and mask
         cv2.imwrite(str(out_img / f"{name}.jpg"), img_out)
         cv2.imwrite(str(out_mask / f"{name}.png"), mask_out)
         
-        # Convert mask to YOLO polygons
         try:
             polygons = mask_to_yolo_polygons(mask_out, target_size[0], target_size[1])
             if polygons:
@@ -109,21 +115,23 @@ def process_split(split_name: str, base_path: Path, output_path: Path, target_si
     return count
 
 def create_data_yaml(output_path: Path):
+    # Create names dictionary for all 20 classes
+    class_names = {i: name for i, name in enumerate(VOC_CLASSES)}
+    
     config = {
         'path': str(output_path.absolute()),
         'train': 'images/train',
         'val': 'images/val',
-        'names': {0: "object"}
+        'names': class_names
     }
     yaml_path = output_path.parent / 'data.yaml'
     with open(yaml_path, 'w') as f:
         yaml.dump(config, f, default_flow_style=False)
-    print(f"✅ Created data.yaml at: {yaml_path}")
+    print(f"✅ Created data.yaml with {len(class_names)} classes at: {yaml_path}")
 
 def main():
-    # Adjust this path to match your actual folder structure
     BASE_PATH = Path("project-image/VOC2012_train_val/VOC2012_train_val")
-    OUTPUT_PATH = Path("output/preprocessed_full")
+    OUTPUT_PATH = Path("output/preprocessed_full_multiclass")
     
     print(f"📂 Base path: {BASE_PATH}")
     print("⏳ Processing train split...")
