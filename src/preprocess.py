@@ -5,8 +5,13 @@ import yaml
 from pathlib import Path
 from tqdm import tqdm
 
-def preprocess_image(img: np.ndarray) -> np.ndarray:
-    """Simplified preprocessing: no warping, no fixed CLAHE."""
+def preprocess_image(img: np.ndarray, max_dim=640) -> np.ndarray:
+    """Downscale large images to max_dim while preserving aspect ratio."""
+    h, w = img.shape[:2]
+    if max(h, w) > max_dim:
+        scale = max_dim / max(h, w)
+        new_w, new_h = int(w * scale), int(h * scale)
+        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
     return img
 
 def mask_to_yolo_polygons(mask: np.ndarray, img_w: int, img_h: int) -> list[str]:
@@ -64,15 +69,15 @@ def process_split(split_name: str, base_path: Path, output_path: Path):
         mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
         if img is None or mask is None: continue
         
-        h, w = img.shape[:2]
         img_out = preprocess_image(img)
-        mask_out = mask # No resizing here, YOLO handles it with letterboxing
+        new_h, new_w = img_out.shape[:2]
+        mask_out = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
         
         cv2.imwrite(str(out_img / f"{name}.jpg"), img_out)
         cv2.imwrite(str(out_mask / f"{name}.png"), mask_out)
         
         try:
-            polygons = mask_to_yolo_polygons(mask_out, w, h)
+            polygons = mask_to_yolo_polygons(mask_out, new_w, new_h)
             if polygons:
                 with open(out_lbl / f"{name}.txt", 'w') as f:
                     f.write('\n'.join(polygons))

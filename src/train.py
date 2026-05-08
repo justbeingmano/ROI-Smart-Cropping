@@ -7,28 +7,29 @@ def main():
     if not Path(data_yaml).exists():
         raise FileNotFoundError(f"❌ {data_yaml} not found.")
 
-    print("🤖 Loading YOLOv8m-seg model (Medium version)...")
-    model = YOLO("yolov8m-seg.pt") # ✅ Upgraded to Medium for better capacity
+    print("🤖 Loading YOLOv8s-seg model (Small version)...")
+    model = YOLO("yolov8s-seg.pt") # ✅ Reverted to Small for 4GB VRAM stability
 
     print(" Starting training (100 epochs)...")
     results = model.train(
         data=data_yaml,
         epochs=100,
         imgsz=640,
-        batch=8,
+        batch=4,           # ✅ Lower batch for 4GB VRAM
+        workers=2,         # ✅ Low workers to prevent HDD thrashing
         device=0,
         project="output/runs",
-        name="voc2012_optimized",
+        name="voc2012_stable",
         patience=20,
         save=True,
         plots=True,
         verbose=True,
         lr0=0.001,
-        mosaic=0.8,        # ✅ Reduced from 1.0 for better boundary focus
+        mosaic=0.8,
         mixup=0.1,
         copy_paste=0.1,
         close_mosaic=10,
-        cache=False
+        cache='ram'        # ✅ Cache images in RAM to bypass HDD bottleneck
     )
 
     print("\n✅ Training finished.")
