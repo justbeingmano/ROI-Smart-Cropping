@@ -9,7 +9,7 @@ import random
 from pathlib import Path
 
 
-OUTPUT_PATH = Path("output/preprocessed_50")
+OUTPUT_PATH = Path("output/preprocessed_full")
 HTML_OUT   = Path("output/visualize.html")
 NUM_SAMPLES = 12  # how many images to show in the viewer
 
@@ -89,7 +89,7 @@ def build_html(samples: list[dict]) -> str:
           <div class="panels">
             <div class="panel">
               <img src="{s['orig']}" alt="Preprocessed Image">
-              <div class="label">Image (640x640, CLAHE)</div>
+              <div class="label">Image (Original Ratio, No Warping)</div>
             </div>
             <div class="panel">
               <img src="{s['mask']}" alt="Mask">
@@ -282,14 +282,14 @@ def build_html(samples: list[dict]) -> str:
   <div class="logo">🔍</div>
   <div>
     <h1>VOC2012 Preprocessed Data Viewer</h1>
-    <p>Showing {len(samples)} randomly sampled images &mdash; 640&times;640, CLAHE normalised, YOLO-Seg labels</p>
+    <p>Showing {len(samples)} randomly sampled images &mdash; Original Aspect Ratio, Multi-contour YOLO labels</p>
   </div>
 </header>
 
 <div class="stats-bar">
   <div class="stat"><span class="stat-dot dot-purple"></span>Dataset: <strong>PASCAL VOC 2012</strong></div>
-  <div class="stat"><span class="stat-dot dot-blue"></span>Resolution: <strong>640 × 640</strong></div>
-  <div class="stat"><span class="stat-dot dot-green"></span>Normalisation: <strong>CLAHE (L-channel)</strong></div>
+  <div class="stat"><span class="stat-dot dot-blue"></span>Resolution: <strong>Original</strong></div>
+  <div class="stat"><span class="stat-dot dot-green"></span>Processing: <strong>Raw (No Warping)</strong></div>
   <div class="stat"><span class="stat-dot dot-purple"></span>Format: <strong>YOLO-Segmentation</strong></div>
   <div class="stat"><span class="stat-dot dot-blue"></span>Sample shown: <strong>{len(samples)} / total</strong></div>
 </div>
@@ -327,9 +327,9 @@ def build_html(samples: list[dict]) -> str:
 
 
 def main():
-    img_dir   = OUTPUT_PATH / "images"
-    mask_dir  = OUTPUT_PATH / "masks"
-    label_dir = OUTPUT_PATH / "labels"
+    img_dir   = OUTPUT_PATH / "images" / "train"
+    mask_dir  = OUTPUT_PATH / "masks" / "train"
+    label_dir = OUTPUT_PATH / "labels" / "train"
 
     all_imgs = sorted(img_dir.glob("*.jpg"))
     if not all_imgs:
