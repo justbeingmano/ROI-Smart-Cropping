@@ -19,10 +19,10 @@ ROOT = Path(__file__).resolve().parent.parent
 VOC_ROOT = ROOT / "project-image" / "VOC2012_train_val" / "VOC2012_train_val"
 OUT_DIR = ROOT / "output" / "dataset"
 
-# 5-class training
+# 5-class instance segmentation setup
 TARGET_CLASSES = ["person", "chair", "car", "dog", "bottle"]
 
-# False = real multi-class training
+# False = true multi-class training
 # person=0, chair=1, car=2, dog=3, bottle=4
 SINGLE_CLASS = False
 SINGLE_CLASS_NAME = "object"
@@ -30,13 +30,15 @@ SINGLE_CLASS_NAME = "object"
 SPLIT_RATIOS = (0.8, 0.1, 0.1)
 RANDOM_STATE = 42
 
+# Mask/polygon processing
 AREA_THRESHOLD = 10
 EPSILON_FACTOR = 0.0005
 
+# Rebuild dataset from scratch each run
 CLEAN_OUT_DIR = True
 
-# Balance only train split
-# Drops some person-only images, but keeps person+other-class images
+# Train-only balancing
+# Drops some person-only images, but keeps person+other-class images.
 BALANCE_PERSON_ONLY_TRAIN = True
 PERSON_ONLY_KEEP_RATIO = 0.4
 
@@ -46,6 +48,7 @@ PERSON_ONLY_KEEP_RATIO = 0.4
 # ============================================================
 
 def voc_colormap(n: int = 256) -> np.ndarray:
+    """Generate the standard Pascal VOC color map."""
     cmap = np.zeros((n, 3), dtype=np.uint8)
 
     for i in range(n):
@@ -69,6 +72,12 @@ VOC_COLOR_TO_INDEX = {
 
 
 def read_voc_index_mask(mask_path: Path) -> np.ndarray | None:
+    """
+    Read VOC SegmentationObject mask as a 2D indexed array.
+
+    Original VOC masks are palette PNGs. PIL preserves the indexed values.
+    RGB fallback is included for dataset mirrors that saved masks as color images.
+    """
     try:
         with Image.open(mask_path) as img:
             arr = np.array(img)
@@ -83,15 +92,16 @@ def read_voc_index_mask(mask_path: Path) -> np.ndarray | None:
     if arr.ndim == 3:
         arr = arr[:, :, :3]
 
+        # If RGB channels are equal, it is effectively grayscale.
         if np.array_equal(arr[:, :, 0], arr[:, :, 1]) and np.array_equal(arr[:, :, 0], arr[:, :, 2]):
             return arr[:, :, 0]
 
+        # RGB VOC-color fallback.
         h, w, _ = arr.shape
         flat = arr.reshape(-1, 3)
         out = np.full((flat.shape[0],), 255, dtype=np.uint8)
 
         unique_colors = np.unique(flat, axis=0)
-
         for color in unique_colors:
             idx = VOC_COLOR_TO_INDEX.get(tuple(color.tolist()), 255)
             matches = np.all(flat == color, axis=1)
@@ -103,10 +113,16 @@ def read_voc_index_mask(mask_path: Path) -> np.ndarray | None:
 
 
 # ============================================================
-# XML HELPERS
+# XML / CLASS HELPERS
 # ============================================================
 
 def get_image_objects(xml_path: Path) -> list[str]:
+    """
+    Parse a VOC XML annotation and return object class names in XML order.
+
+    For VOC SegmentationObject masks, instance_id=1 generally maps to the first
+    XML object, instance_id=2 to the second object, and so on.
+    """
     objects = []
 
     if not xml_path.exists():
@@ -118,7 +134,6 @@ def get_image_objects(xml_path: Path) -> list[str]:
 
         for obj in root.findall("object"):
             cls_obj = obj.find("name")
-
             if cls_obj is not None and cls_obj.text:
                 objects.append(cls_obj.text.strip())
 
@@ -129,6 +144,8 @@ def get_image_objects(xml_path: Path) -> list[str]:
 
 
 def get_target_set(objects: list[str]) -> set[str]:
+    if not TARGET_CLASSES:
+        return set(objects)
     return {c for c in objects if c in TARGET_CLASSES}
 
 
@@ -150,10 +167,22 @@ def names_for_yaml() -> dict[int, str]:
 
 
 # ============================================================
-# MASK TO YOLO POLYGONS
+# POLYGON CONVERSION
 # ============================================================
 
 def mask_to_polygons(mask_path: Path, img_w: int, img_h: int, object_names: list[str]):
+    """
+    Convert VOC SegmentationObject mask to YOLO polygon labels.
+
+    Rules:
+    - use SegmentationObject, not SegmentationClass
+    - use original-resolution mask
+    - do not resize before contour extraction
+    - export target instances only
+    - keep all valid external contours
+    - simplify polygons safely
+    - normalize by original image width/height
+    """
     mask = read_voc_index_mask(mask_path)
 
     if mask is None:
@@ -179,12 +208,11 @@ def mask_to_polygons(mask_path: Path, img_w: int, img_h: int, object_names: list
 
         class_name = object_names[xml_index]
 
-        if class_name not in TARGET_CLASSES:
+        if TARGET_CLASSES and class_name not in TARGET_CLASSES:
             skipped_non_target += 1
             continue
 
         class_id = class_id_for_name(class_name)
-
         if class_id is None:
             skipped_non_target += 1
             continue
@@ -200,7 +228,7 @@ def mask_to_polygons(mask_path: Path, img_w: int, img_h: int, object_names: list
         contours, _ = cv2.findContours(
             binary,
             cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE
+            cv2.CHAIN_APPROX_SIMPLE,
         )
 
         for cnt in contours:
@@ -212,18 +240,16 @@ def mask_to_polygons(mask_path: Path, img_w: int, img_h: int, object_names: list
 
             pts = approx.reshape(-1, 2)
 
+            # Must have at least 3 unique points for a valid polygon.
             if len(np.unique(pts, axis=0)) < 3:
                 continue
 
             pts = pts.astype(np.float32)
-
             pts[:, 0] /= img_w
             pts[:, 1] /= img_h
-
             pts = np.clip(pts, 0.0, 1.0)
 
             coords = " ".join(f"{p[0]:.6f} {p[1]:.6f}" for p in pts)
-
             yolo_lines.append(f"{class_id} {coords}")
 
     if not yolo_lines:
@@ -241,17 +267,30 @@ def mask_to_polygons(mask_path: Path, img_w: int, img_h: int, object_names: list
 # ============================================================
 
 def apply_train_balancing(train_ids: list[str], id_to_targets: dict[str, set[str]]) -> list[str]:
+    """
+    Downsample only person-only train images.
+
+    This keeps useful co-occurrence images like:
+    - person + chair
+    - person + car
+    - person + dog
+    - person + bottle
+
+    Val/test are never balanced, to keep evaluation natural and fair.
+    """
     if not BALANCE_PERSON_ONLY_TRAIN:
         return train_ids
 
-    rng = random.Random(RANDOM_STATE)
+    if "person" not in TARGET_CLASSES or len(TARGET_CLASSES) <= 1:
+        print("ℹ️ Train balancing skipped: use it only for multi-class experiments with person.")
+        return train_ids
 
+    rng = random.Random(RANDOM_STATE)
     balanced = []
     dropped = 0
 
     for img_id in train_ids:
         targets = id_to_targets.get(img_id, set())
-
         is_person_only = targets == {"person"}
 
         if is_person_only and rng.random() > PERSON_ONLY_KEEP_RATIO:
@@ -318,8 +357,8 @@ def main():
 
     error_samples = defaultdict(list)
 
-    id_to_objects = {}
-    id_to_targets = {}
+    id_to_objects: dict[str, list[str]] = {}
+    id_to_targets: dict[str, set[str]] = {}
 
     valid_ids = []
 
@@ -352,14 +391,14 @@ def main():
         valid_ids,
         test_size=temp_ratio,
         random_state=RANDOM_STATE,
-        shuffle=True
+        shuffle=True,
     )
 
     val_ids, test_ids = train_test_split(
         temp_ids,
         test_size=test_fraction_of_temp,
         random_state=RANDOM_STATE,
-        shuffle=True
+        shuffle=True,
     )
 
     train_ids = apply_train_balancing(train_ids, id_to_targets)
@@ -367,7 +406,7 @@ def main():
     splits = {
         "train": train_ids,
         "val": val_ids,
-        "test": test_ids
+        "test": test_ids,
     }
 
     print("\n📊 Target image counts by split:")
@@ -411,7 +450,7 @@ def main():
                 src_mask,
                 w,
                 h,
-                id_to_objects.get(img_id, [])
+                id_to_objects.get(img_id, []),
             )
 
             if polygons:
@@ -436,7 +475,7 @@ def main():
         "train": "images/train",
         "val": "images/val",
         "test": "images/test",
-        "names": names_for_yaml()
+        "names": names_for_yaml(),
     }
 
     with open(yaml_path, "w", encoding="utf-8") as f:
@@ -444,7 +483,7 @@ def main():
             yaml_content,
             f,
             sort_keys=False,
-            default_flow_style=False
+            default_flow_style=False,
         )
 
     assert yaml_path.exists(), f"data.yaml was not created at {yaml_path}"

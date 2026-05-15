@@ -14,36 +14,36 @@ from ultralytics import YOLO
 ROOT = Path(__file__).resolve().parent.parent
 DATA_YAML = ROOT / "output" / "dataset" / "data.yaml"
 
-# Recommended for GTX 1650 if it fits.
-# Use yolov8n-seg.pt only if yolov8s-seg.pt becomes unstable.
-MODEL_VARIANT = "yolov8s-seg.pt"
+# RTX 3080 recommended setup.
+# If VRAM is not enough, switch to yolov8s-seg.pt.
+MODEL_VARIANT = "yolov8m-seg.pt"
 
-# Longer training for better mask convergence.
-EPOCHS = 200
-PATIENCE = 50
+# Stronger training for 5-class segmentation.
+EPOCHS = 250
+PATIENCE = 60
 
-# Higher resolution for better segmentation masks.
-# If this causes OOM even at batch=1, reduce to 640.
-IMG_SIZE = 768
+# Higher resolution improves mask boundaries and small objects.
+# If it is too slow/OOM, reduce to 768.
+IMG_SIZE = 896
 
 # Dynamic batch fallback.
-# The script will try these from largest to smallest.
-BATCH_CANDIDATES = [8, 4, 2, 1]
+# The script tries the largest batch first, then retries smaller batches on CUDA OOM.
+BATCH_CANDIDATES = [16, 12, 8, 4]
 
-WORKERS = 2
+WORKERS = 8
 DEVICE = 0
 
-# User requested RAM cache.
-# If Windows starts slowing down badly, switch this to "disk".
-CACHE_MODE = "ram"
+# For 16GB system RAM, disk cache is safer than RAM cache.
+# If your friend has lots of free RAM and GPU utilization drops, try "ram".
+CACHE_MODE = "disk"
 
-RUN_NAME = "voc2012_person_dynamic_bs_img768"
+RUN_NAME = "voc2012_5class_rtx3080_yolov8m_img896"
 
 # Quality watcher thresholds.
-QUALITY_MIN_EPOCH = 30
-QUALITY_PATIENCE = 12
-MIN_MASK_MAP5095 = 0.08
-MIN_MASK_RECALL = 0.20
+QUALITY_MIN_EPOCH = 40
+QUALITY_PATIENCE = 15
+MIN_MASK_MAP5095 = 0.20
+MIN_MASK_RECALL = 0.35
 
 
 # ============================================================
@@ -71,7 +71,7 @@ def extract_per_class_mask_metrics(metrics) -> list[dict]:
     """
     Extract per-class segmentation metrics from Ultralytics validation results.
 
-    Expected common structure:
+    Common SegmentMetrics structure:
     metrics.seg.p
     metrics.seg.r
     metrics.seg.ap50
@@ -184,8 +184,8 @@ class QualityWatchCallback:
     """
     Watches validation mask metrics during training.
 
-    It does not change the training while running.
-    Instead, it saves recommendation files if results are weak or plateaued.
+    It does not mutate training parameters mid-run.
+    It only saves recommendation files if results are weak or plateaued.
     """
 
     def __init__(
@@ -253,12 +253,12 @@ class QualityWatchCallback:
             "best_mask_mAP50_95_seen": self.best_map,
             "reason": "weak_metrics" if clearly_weak else "plateau",
             "recommended_next_edits": [
-                "If IMG_SIZE=768 is unstable, use IMG_SIZE=640.",
-                "If recall is weak, try mosaic=0.0 for one run.",
-                "If mAP50-95 is weak but mAP50 is okay, keep IMG_SIZE high and train longer.",
-                "Keep mixup=0.0 for segmentation.",
-                "Keep copy_paste=0.2 unless pasted masks look unrealistic.",
-                "After the person baseline is stable, move to 5 classes with SINGLE_CLASS=False.",
+                "If RTX 3080 OOM happens often, reduce IMG_SIZE to 768.",
+                "If training is stable but recall is weak, test mosaic=0.0 for one run.",
+                "If mAP50 is good but mAP50-95 is weak, keep high IMG_SIZE and train longer.",
+                "If class imbalance hurts person/chair/car metrics, tune PERSON_ONLY_KEEP_RATIO in preprocessing.",
+                "If yolov8m-seg is too slow, use yolov8s-seg for faster iteration.",
+                "If results plateau early, try freeze=10 for a separate fine-tuning experiment.",
             ],
         }
 
@@ -297,7 +297,7 @@ def is_cuda_oom(error: Exception) -> bool:
     return (
         "cuda out of memory" in message
         or "outofmemoryerror" in message
-        or "cublas" in message and "alloc" in message
+        or ("cublas" in message and "alloc" in message)
     )
 
 
@@ -317,19 +317,20 @@ def print_gpu_status():
     allocated = torch.cuda.memory_allocated(0) / (1024 ** 3)
     reserved = torch.cuda.memory_reserved(0) / (1024 ** 3)
 
-    print(f"GPU          : {device_name}")
-    print(f"VRAM allocated: {allocated:.2f} GB")
-    print(f"VRAM reserved : {reserved:.2f} GB")
+    print(f"GPU             : {device_name}")
+    print(f"VRAM allocated  : {allocated:.2f} GB")
+    print(f"VRAM reserved   : {reserved:.2f} GB")
 
 
 # ============================================================
-# TRAINING FUNCTION
+# TRAINING
 # ============================================================
 
 def train_once(batch_size: int):
     """
     Train one run with a specific batch size.
-    If CUDA OOM happens, the outer loop catches it and retries with smaller batch.
+
+    If CUDA OOM happens, the outer loop catches it and retries with a smaller batch.
     """
     print("\n" + "=" * 64)
     print(f"🚀 Starting training attempt with batch={batch_size}, imgsz={IMG_SIZE}")
@@ -360,24 +361,27 @@ def train_once(batch_size: int):
         amp=True,
         cache=CACHE_MODE,
 
-        # Optimization
-        lr0=5e-4,
+        # Fine-tuning optimization for pretrained YOLO segmentation.
+        optimizer="AdamW",
+        lr0=1e-4,
+        lrf=0.01,
         cos_lr=True,
+        weight_decay=5e-4,
         seed=42,
         deterministic=True,
 
-        # Controlled geometric augmentation
+        # Controlled geometric augmentation.
         degrees=5.0,
-        scale=0.3,
+        scale=0.4,
         fliplr=0.5,
 
-        # Segmentation-friendly augmentation
+        # Segmentation-friendly augmentation.
         mosaic=0.1,
         mixup=0.0,
-        copy_paste=0.2,
-        close_mosaic=30,
+        copy_paste=0.25,
+        close_mosaic=40,
 
-        # Output
+        # Output.
         project=str(ROOT / "output" / "runs"),
         name=run_name,
         exist_ok=True,
@@ -389,10 +393,7 @@ def train_once(batch_size: int):
 
 
 def train_with_dynamic_batch():
-    """
-    Try large batch first.
-    If CUDA OOM happens, retry with smaller batch automatically.
-    """
+    """Try large batch first, then retry smaller batches if CUDA OOM occurs."""
     last_error = None
 
     for batch_size in BATCH_CANDIDATES:
@@ -522,11 +523,11 @@ def evaluate_best_checkpoint(model, results, used_batch: int):
             f.write(f"- Used batch: {used_batch}\n")
             f.write(f"- Image size: {IMG_SIZE}\n\n")
             f.write("## Suggested next edits\n\n")
-            f.write("1. If training crashed before this run, reduce IMG_SIZE to 640.\n")
+            f.write("1. If training crashed before this run, reduce IMG_SIZE to 768.\n")
             f.write("2. If recall is weak, try `mosaic=0.0`.\n")
-            f.write("3. If precision is high but recall is weak, lower prediction confidence during inference.\n")
-            f.write("4. Move to 5 classes with `SINGLE_CLASS=False` after the person baseline is stable.\n")
-            f.write("5. For 5 classes, enable person-only train downsampling only if person dominates.\n")
+            f.write("3. If mAP50 is good but mAP50-95 is weak, train longer or keep high image size.\n")
+            f.write("4. If one class is much worse, inspect per-class prediction images.\n")
+            f.write("5. If person dominates again, tune PERSON_ONLY_KEEP_RATIO in preprocessing.\n")
 
         print(f"⚠️ Low final score detected. Recommendations saved to: {final_reco_path}")
 
@@ -545,18 +546,18 @@ def main():
         return
 
     print("=" * 64)
-    print("🚀 YOLOv8-Seg Dynamic Batch Training")
+    print("🚀 YOLOv8-Seg RTX 3080 Dynamic Batch Training")
     print("=" * 64)
-    print(f"Data YAML       : {DATA_YAML.resolve()}")
-    print(f"Model           : {MODEL_VARIANT}")
-    print(f"Epochs          : {EPOCHS}")
-    print(f"Patience        : {PATIENCE}")
-    print(f"Image size      : {IMG_SIZE}")
-    print(f"Batch candidates: {BATCH_CANDIDATES}")
-    print(f"Cache mode      : {CACHE_MODE}")
-    print(f"Device          : {DEVICE}")
-    print(f"CUDA available  : {torch.cuda.is_available()}")
-    print (f"batch size      : {BATCH_SIZE} ")
+    print(f"Data YAML        : {DATA_YAML.resolve()}")
+    print(f"Model            : {MODEL_VARIANT}")
+    print(f"Epochs           : {EPOCHS}")
+    print(f"Patience         : {PATIENCE}")
+    print(f"Image size       : {IMG_SIZE}")
+    print(f"Batch candidates : {BATCH_CANDIDATES}")
+    print(f"Cache mode       : {CACHE_MODE}")
+    print(f"Workers          : {WORKERS}")
+    print(f"Device           : {DEVICE}")
+    print(f"CUDA available   : {torch.cuda.is_available()}")
     print_gpu_status()
     print("=" * 64)
 
