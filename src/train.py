@@ -1,81 +1,573 @@
-# src/train.py
-from ultralytics import YOLO
-from pathlib import Path
-import torch
+import csv
 import gc
+import json
+from pathlib import Path
 
-def train_with_auto_batch(data_yaml: str, max_batch: int = 8):
-    """
-    Attempts to train with the highest possible batch size for the available VRAM.
-    Starts at max_batch and reduces it if CUDA OOM occurs.
-    """
-    batch_sizes = [max_batch, 6, 4] # Sequence of batches to try
-    
-    for batch in batch_sizes:
-        print(f"\n🚀 Attempting training with Batch Size: {batch}...")
-        
-        # Clear GPU memory cache before each attempt
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
+import numpy as np
+import torch
+from ultralytics import YOLO
 
+# ============================================================
+# TRAINING CONFIGURATION
+# ============================================================
+
+ROOT = Path(__file__).resolve().parent.parent
+DATA_YAML = ROOT / "output" / "dataset" / "data.yaml"
+
+# Recommended for GTX 1650 if it fits.
+# Use yolov8n-seg.pt only if yolov8s-seg.pt becomes unstable.
+MODEL_VARIANT = "yolov8s-seg.pt"
+
+# Longer training for better mask convergence.
+EPOCHS = 200
+PATIENCE = 50
+
+# Higher resolution for better segmentation masks.
+# If this causes OOM even at batch=1, reduce to 640.
+IMG_SIZE = 768
+
+# Dynamic batch fallback.
+# The script will try these from largest to smallest.
+BATCH_CANDIDATES = [8, 4, 2, 1]
+
+WORKERS = 2
+DEVICE = 0
+
+# User requested RAM cache.
+# If Windows starts slowing down badly, switch this to "disk".
+CACHE_MODE = "ram"
+
+RUN_NAME = "voc2012_person_dynamic_bs_img768"
+
+# Quality watcher thresholds.
+QUALITY_MIN_EPOCH = 30
+QUALITY_PATIENCE = 12
+MIN_MASK_MAP5095 = 0.08
+MIN_MASK_RECALL = 0.20
+
+
+# ============================================================
+# METRIC HELPERS
+# ============================================================
+
+def get_metric(results_dict: dict, candidates: list[str]) -> float:
+    """Handle small naming differences across Ultralytics versions."""
+    for key in candidates:
+        if key in results_dict:
+            return float(results_dict[key])
+    return 0.0
+
+
+def safe_array(value):
+    if value is None:
+        return np.array([])
+    try:
+        return np.asarray(value, dtype=float)
+    except Exception:
+        return np.array([])
+
+
+def extract_per_class_mask_metrics(metrics) -> list[dict]:
+    """
+    Extract per-class segmentation metrics from Ultralytics validation results.
+
+    Expected common structure:
+    metrics.seg.p
+    metrics.seg.r
+    metrics.seg.ap50
+    metrics.seg.ap
+    metrics.seg.maps
+    """
+    names = getattr(metrics, "names", {}) or {}
+    seg = getattr(metrics, "seg", None)
+
+    if seg is None:
+        return []
+
+    p = safe_array(getattr(seg, "p", None))
+    r = safe_array(getattr(seg, "r", None))
+    ap50 = safe_array(getattr(seg, "ap50", None))
+    ap = safe_array(getattr(seg, "ap", None))
+    maps = safe_array(getattr(seg, "maps", None))
+    ap_class_index = getattr(seg, "ap_class_index", None)
+
+    if ap_class_index is not None:
+        class_ids = [int(x) for x in np.asarray(ap_class_index).tolist()]
+    else:
+        max_len = max(len(p), len(r), len(ap50), len(ap), len(maps), len(names))
+        class_ids = list(range(max_len))
+
+    rows = []
+
+    for pos, cls_id in enumerate(class_ids):
+        if isinstance(names, dict):
+            class_name = names.get(cls_id, str(cls_id))
+        else:
+            class_name = str(cls_id)
+
+        row = {
+            "class_id": cls_id,
+            "class_name": class_name,
+            "precision_M": float(p[pos]) if pos < len(p) else 0.0,
+            "recall_M": float(r[pos]) if pos < len(r) else 0.0,
+            "mAP50_M": float(ap50[pos]) if pos < len(ap50) else 0.0,
+            "mAP50_95_M": (
+                float(maps[cls_id])
+                if cls_id < len(maps)
+                else float(ap[pos]) if pos < len(ap)
+                else 0.0
+            ),
+        }
+
+        rows.append(row)
+
+    return rows
+
+
+def save_per_class_metrics(rows: list[dict], save_dir: Path, filename: str = "per_class_mask_metrics.csv"):
+    save_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = save_dir / filename
+
+    fieldnames = [
+        "class_id",
+        "class_name",
+        "precision_M",
+        "recall_M",
+        "mAP50_M",
+        "mAP50_95_M",
+    ]
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+    return csv_path
+
+
+def print_per_class_metrics(rows: list[dict]):
+    if not rows:
+        print("⚠️ Per-class mask metrics were not available.")
+        return
+
+    print("\n📊 PER-CLASS MASK PERFORMANCE")
+    print("-" * 86)
+    print(
+        f"{'ID':>3} | "
+        f"{'Class':<15} | "
+        f"{'Prec(M)':>8} | "
+        f"{'Recall(M)':>9} | "
+        f"{'mAP50(M)':>9} | "
+        f"{'mAP50-95(M)':>12}"
+    )
+    print("-" * 86)
+
+    for row in rows:
+        print(
+            f"{row['class_id']:>3} | "
+            f"{row['class_name']:<15} | "
+            f"{row['precision_M']:>8.4f} | "
+            f"{row['recall_M']:>9.4f} | "
+            f"{row['mAP50_M']:>9.4f} | "
+            f"{row['mAP50_95_M']:>12.4f}"
+        )
+
+    print("-" * 86)
+
+
+# ============================================================
+# QUALITY CALLBACK
+# ============================================================
+
+class QualityWatchCallback:
+    """
+    Watches validation mask metrics during training.
+
+    It does not change the training while running.
+    Instead, it saves recommendation files if results are weak or plateaued.
+    """
+
+    def __init__(
+        self,
+        min_epoch: int,
+        patience: int,
+        min_mask_map5095: float,
+        min_mask_recall: float,
+    ):
+        self.min_epoch = min_epoch
+        self.patience = patience
+        self.min_mask_map5095 = min_mask_map5095
+        self.min_mask_recall = min_mask_recall
+        self.best_map = -1.0
+        self.bad_epochs = 0
+        self.already_written = False
+
+    def __call__(self, trainer):
+        epoch = int(getattr(trainer, "epoch", -1)) + 1
+
+        metrics = getattr(trainer, "metrics", {}) or {}
+        if not isinstance(metrics, dict):
+            return
+
+        map5095 = get_metric(
+            metrics,
+            [
+                "metrics/mAP50-95(M)",
+                "metrics/mAP50-95_mask",
+                "metrics/mAP50-95(B)",
+            ],
+        )
+
+        recall = get_metric(
+            metrics,
+            [
+                "metrics/recall(M)",
+                "metrics/recall_mask",
+                "metrics/recall(B)",
+            ],
+        )
+
+        if epoch < self.min_epoch:
+            return
+
+        if map5095 > self.best_map + 1e-4:
+            self.best_map = map5095
+            self.bad_epochs = 0
+        else:
+            self.bad_epochs += 1
+
+        clearly_weak = map5095 < self.min_mask_map5095 and recall < self.min_mask_recall
+        plateaued = self.bad_epochs >= self.patience
+
+        if not (clearly_weak or plateaued) or self.already_written:
+            return
+
+        save_dir = Path(getattr(trainer, "save_dir", ROOT / "output" / "runs" / RUN_NAME))
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        recommendations = {
+            "trigger_epoch": epoch,
+            "current_mask_mAP50_95": map5095,
+            "current_mask_recall": recall,
+            "best_mask_mAP50_95_seen": self.best_map,
+            "reason": "weak_metrics" if clearly_weak else "plateau",
+            "recommended_next_edits": [
+                "If IMG_SIZE=768 is unstable, use IMG_SIZE=640.",
+                "If recall is weak, try mosaic=0.0 for one run.",
+                "If mAP50-95 is weak but mAP50 is okay, keep IMG_SIZE high and train longer.",
+                "Keep mixup=0.0 for segmentation.",
+                "Keep copy_paste=0.2 unless pasted masks look unrealistic.",
+                "After the person baseline is stable, move to 5 classes with SINGLE_CLASS=False.",
+            ],
+        }
+
+        json_path = save_dir / "auto_tuning_recommendations.json"
+        md_path = save_dir / "auto_tuning_recommendations.md"
+
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(recommendations, f, indent=2)
+
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write("# Auto Tuning Recommendations\n\n")
+            f.write(f"- Trigger epoch: {epoch}\n")
+            f.write(f"- Current mask mAP50-95: {map5095:.4f}\n")
+            f.write(f"- Current mask recall: {recall:.4f}\n")
+            f.write(f"- Best mask mAP50-95 seen: {self.best_map:.4f}\n")
+            f.write(f"- Reason: {recommendations['reason']}\n\n")
+            f.write("## Recommended next-run edits\n\n")
+            for item in recommendations["recommended_next_edits"]:
+                f.write(f"- {item}\n")
+
+        print("\n" + "!" * 72)
+        print("⚠️ QUALITY WATCH CALLBACK TRIGGERED")
+        print(f"Mask mAP50-95={map5095:.4f}, Recall={recall:.4f}, Best={self.best_map:.4f}")
+        print(f"Saved recommendations to: {json_path}")
+        print("!" * 72 + "\n")
+
+        self.already_written = True
+
+
+# ============================================================
+# CUDA / OOM HELPERS
+# ============================================================
+
+def is_cuda_oom(error: Exception) -> bool:
+    message = str(error).lower()
+    return (
+        "cuda out of memory" in message
+        or "outofmemoryerror" in message
+        or "cublas" in message and "alloc" in message
+    )
+
+
+def cleanup_cuda():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+
+def print_gpu_status():
+    if not torch.cuda.is_available():
+        print("CUDA: False")
+        return
+
+    device_name = torch.cuda.get_device_name(0)
+    allocated = torch.cuda.memory_allocated(0) / (1024 ** 3)
+    reserved = torch.cuda.memory_reserved(0) / (1024 ** 3)
+
+    print(f"GPU          : {device_name}")
+    print(f"VRAM allocated: {allocated:.2f} GB")
+    print(f"VRAM reserved : {reserved:.2f} GB")
+
+
+# ============================================================
+# TRAINING FUNCTION
+# ============================================================
+
+def train_once(batch_size: int):
+    """
+    Train one run with a specific batch size.
+    If CUDA OOM happens, the outer loop catches it and retries with smaller batch.
+    """
+    print("\n" + "=" * 64)
+    print(f"🚀 Starting training attempt with batch={batch_size}, imgsz={IMG_SIZE}")
+    print("=" * 64)
+
+    model = YOLO(MODEL_VARIANT)
+
+    model.add_callback(
+        "on_fit_epoch_end",
+        QualityWatchCallback(
+            min_epoch=QUALITY_MIN_EPOCH,
+            patience=QUALITY_PATIENCE,
+            min_mask_map5095=MIN_MASK_MAP5095,
+            min_mask_recall=MIN_MASK_RECALL,
+        ),
+    )
+
+    run_name = f"{RUN_NAME}_bs{batch_size}"
+
+    results = model.train(
+        data=str(DATA_YAML.resolve()),
+        epochs=EPOCHS,
+        patience=PATIENCE,
+        imgsz=IMG_SIZE,
+        batch=batch_size,
+        workers=WORKERS,
+        device=DEVICE,
+        amp=True,
+        cache=CACHE_MODE,
+
+        # Optimization
+        lr0=5e-4,
+        cos_lr=True,
+        seed=42,
+        deterministic=True,
+
+        # Controlled geometric augmentation
+        degrees=5.0,
+        scale=0.3,
+        fliplr=0.5,
+
+        # Segmentation-friendly augmentation
+        mosaic=0.1,
+        mixup=0.0,
+        copy_paste=0.2,
+        close_mosaic=30,
+
+        # Output
+        project=str(ROOT / "output" / "runs"),
+        name=run_name,
+        exist_ok=True,
+        save=True,
+        plots=True,
+    )
+
+    return model, results, batch_size
+
+
+def train_with_dynamic_batch():
+    """
+    Try large batch first.
+    If CUDA OOM happens, retry with smaller batch automatically.
+    """
+    last_error = None
+
+    for batch_size in BATCH_CANDIDATES:
         try:
-            model = YOLO("yolov8s-seg.pt")
-            
-            results = model.train(
-                data=data_yaml,
-                epochs=100,
-                imgsz=640,          # YOLO handles letterboxing internally
-                batch=batch,        # Dynamic batch size
-                workers=4,          # Balanced workers for SSD
-                device=0,
-                project="output/runs",
-                name=f"voc2012_seg_best",
-                patience=20,
-                save=True,
-                plots=True,
-                verbose=True,
-                lr0=0.001,          # Stable learning rate
-                mosaic=0.8,         # Good balance for segmentation
-                mixup=0.1,
-                copy_paste=0.1,
-                close_mosaic=10,    # Refine masks in last 10 epochs
-                cache='ram'         # Critical for speed on NVMe SSD
-            )
-            
-            # If we get here, training started successfully!
-            print(f"\n✅ SUCCESS! Training started with Batch Size: {batch}")
-            
-            # Run final validation on the best model
-            print("\n📊 Running final validation...")
-            val_metrics = model.val(data=data_yaml, plots=True)
-            metrics = val_metrics.results_dict
-            
-            print("\n🏆 FINAL SEGMENTATION METRICS:")
-            print(f"   • Precision (B): {metrics.get('metrics/precision(B)', 0):.4f}")
-            print(f"   • Recall (B)   : {metrics.get('metrics/recall(B)', 0):.4f}")
-            print(f"   • mAP50-95 (M) : {metrics.get('metrics/mAP50-95(M)', 0):.4f}") # Most important for Segmentation
-            print(f"\n📁 Results saved in: output/runs/voc2012_seg_best/")
-            
-            return # Exit function after success
+            cleanup_cuda()
+            model, results, used_batch = train_once(batch_size)
+            return model, results, used_batch
 
         except RuntimeError as e:
-            if "CUDA out of memory" in str(e):
-                print(f"❌ FAILED: CUDA Out of Memory with Batch={batch}. Trying smaller batch...")
-                continue # Try the next smaller batch
-            else:
-                raise e # If it's a different error, stop and show it
+            last_error = e
 
-    print("❌ CRITICAL ERROR: Could not start training even with Batch=2. Check your GPU drivers or hardware.")
+            if is_cuda_oom(e):
+                print("\n" + "!" * 72)
+                print(f"⚠️ CUDA OOM with batch={batch_size}. Retrying with smaller batch...")
+                print("!" * 72 + "\n")
+
+                cleanup_cuda()
+                continue
+
+            raise
+
+        except torch.cuda.OutOfMemoryError as e:
+            last_error = e
+
+            print("\n" + "!" * 72)
+            print(f"⚠️ CUDA OOM with batch={batch_size}. Retrying with smaller batch...")
+            print("!" * 72 + "\n")
+
+            cleanup_cuda()
+            continue
+
+    raise RuntimeError(
+        f"All batch candidates failed: {BATCH_CANDIDATES}. "
+        f"Last error: {last_error}"
+    )
+
+
+# ============================================================
+# EVALUATION
+# ============================================================
+
+def evaluate_best_checkpoint(model, results, used_batch: int):
+    print("\n" + "=" * 64)
+    print("🏆 TRAINING COMPLETE")
+    print("=" * 64)
+
+    save_dir = Path(results.save_dir)
+    best_weights = save_dir / "weights" / "best.pt"
+
+    if best_weights.exists():
+        print(f"✅ Loading best checkpoint for test evaluation: {best_weights}")
+        eval_model = YOLO(str(best_weights))
+    else:
+        print("⚠️ best.pt not found; evaluating current model state.")
+        eval_model = model
+
+    print("\n📊 Evaluating on Test Set...")
+
+    metrics = eval_model.val(
+        data=str(DATA_YAML.resolve()),
+        split="test",
+        imgsz=IMG_SIZE,
+        batch=used_batch,
+        device=DEVICE,
+        plots=True,
+    )
+
+    results_dict = metrics.results_dict
+
+    precision_m = get_metric(
+        results_dict,
+        [
+            "metrics/precision(M)",
+            "metrics/precision_mask",
+            "metrics/precision(B)",
+        ],
+    )
+
+    recall_m = get_metric(
+        results_dict,
+        [
+            "metrics/recall(M)",
+            "metrics/recall_mask",
+            "metrics/recall(B)",
+        ],
+    )
+
+    map50_m = get_metric(
+        results_dict,
+        [
+            "metrics/mAP50(M)",
+            "metrics/mAP50_mask",
+            "metrics/mAP50(B)",
+        ],
+    )
+
+    map5095_m = get_metric(
+        results_dict,
+        [
+            "metrics/mAP50-95(M)",
+            "metrics/mAP50-95_mask",
+            "metrics/mAP50-95(B)",
+        ],
+    )
+
+    print("\n📈 FINAL TEST SEGMENTATION PERFORMANCE:")
+    print(f"   • Used batch    : {used_batch}")
+    print(f"   • Image size    : {IMG_SIZE}")
+    print(f"   • Precision (M): {precision_m:.4f}")
+    print(f"   • Recall (M)   : {recall_m:.4f}")
+    print(f"   • mAP50 (M)    : {map50_m:.4f}")
+    print(f"   • mAP50-95 (M) : {map5095_m:.4f}")
+
+    per_class_rows = extract_per_class_mask_metrics(metrics)
+    print_per_class_metrics(per_class_rows)
+
+    csv_path = save_per_class_metrics(per_class_rows, save_dir)
+    print(f"\n✅ Per-class mask metrics saved to: {csv_path}")
+
+    if map5095_m < MIN_MASK_MAP5095 or recall_m < MIN_MASK_RECALL:
+        final_reco_path = save_dir / "final_low_score_recommendations.md"
+
+        with open(final_reco_path, "w", encoding="utf-8") as f:
+            f.write("# Final Low-Score Recommendations\n\n")
+            f.write(f"- Final test mAP50-95(M): {map5095_m:.4f}\n")
+            f.write(f"- Final test recall(M): {recall_m:.4f}\n")
+            f.write(f"- Used batch: {used_batch}\n")
+            f.write(f"- Image size: {IMG_SIZE}\n\n")
+            f.write("## Suggested next edits\n\n")
+            f.write("1. If training crashed before this run, reduce IMG_SIZE to 640.\n")
+            f.write("2. If recall is weak, try `mosaic=0.0`.\n")
+            f.write("3. If precision is high but recall is weak, lower prediction confidence during inference.\n")
+            f.write("4. Move to 5 classes with `SINGLE_CLASS=False` after the person baseline is stable.\n")
+            f.write("5. For 5 classes, enable person-only train downsampling only if person dominates.\n")
+
+        print(f"⚠️ Low final score detected. Recommendations saved to: {final_reco_path}")
+
+    print(f"\n📁 Results saved in: {save_dir}")
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-    data_yaml = "output/data.yaml"
-    if not Path(data_yaml).exists():
-        raise FileNotFoundError(f"❌ {data_yaml} not found. Run preprocess.py first.")
+    if not DATA_YAML.exists():
+        print("❌ Error: data.yaml not found.")
+        print(f"   Expected location: {DATA_YAML.resolve()}")
+        print("   Please run preprocess_final.py first.")
+        return
 
-    print("🤖 Loading YOLOv8s-seg model...")
-    # Start with batch=8, let the function handle the rest
-    train_with_auto_batch(data_yaml, max_batch=8)
+    print("=" * 64)
+    print("🚀 YOLOv8-Seg Dynamic Batch Training")
+    print("=" * 64)
+    print(f"Data YAML       : {DATA_YAML.resolve()}")
+    print(f"Model           : {MODEL_VARIANT}")
+    print(f"Epochs          : {EPOCHS}")
+    print(f"Patience        : {PATIENCE}")
+    print(f"Image size      : {IMG_SIZE}")
+    print(f"Batch candidates: {BATCH_CANDIDATES}")
+    print(f"Cache mode      : {CACHE_MODE}")
+    print(f"Device          : {DEVICE}")
+    print(f"CUDA available  : {torch.cuda.is_available()}")
+    print (f"batch size      : {BATCH_SIZE} ")
+    print_gpu_status()
+    print("=" * 64)
+
+    model, results, used_batch = train_with_dynamic_batch()
+
+    evaluate_best_checkpoint(
+        model=model,
+        results=results,
+        used_batch=used_batch,
+    )
+
 
 if __name__ == "__main__":
     main()
