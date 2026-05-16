@@ -16,6 +16,7 @@ from tqdm import tqdm
 # ============================================================
 
 ROOT = Path(__file__).resolve().parent.parent
+
 VOC_ROOT = ROOT / "project-image" / "VOC2012_train_val" / "VOC2012_train_val"
 OUT_DIR = ROOT / "output" / "dataset"
 
@@ -34,13 +35,28 @@ RANDOM_STATE = 42
 AREA_THRESHOLD = 10
 EPSILON_FACTOR = 0.0005
 
-# Rebuild dataset from scratch each run
+# Rebuild YOLO dataset from scratch each run
 CLEAN_OUT_DIR = True
 
-# Train-only balancing
-# Drops some person-only images, but keeps person+other-class images.
-BALANCE_PERSON_ONLY_TRAIN = True
+# ============================================================
+# BALANCING / UPSAMPLING
+# ============================================================
+
+# Do NOT downsample person now because segmentation data is already limited.
+BALANCE_PERSON_ONLY_TRAIN = False
 PERSON_ONLY_KEEP_RATIO = 0.4
+
+# Upsample rare classes in TRAIN ONLY.
+# This creates duplicate image/label files with _dupN suffixes.
+UPSAMPLE_RARE_CLASSES = True
+
+CLASS_UPSAMPLE_FACTORS = {
+    "person": 1,
+    "chair": 2,
+    "car": 2,
+    "dog": 2,
+    "bottle": 3,
+}
 
 
 # ============================================================
@@ -48,7 +64,7 @@ PERSON_ONLY_KEEP_RATIO = 0.4
 # ============================================================
 
 def voc_colormap(n: int = 256) -> np.ndarray:
-    """Generate the standard Pascal VOC color map."""
+    """Generate standard Pascal VOC color map."""
     cmap = np.zeros((n, 3), dtype=np.uint8)
 
     for i in range(n):
@@ -75,7 +91,8 @@ def read_voc_index_mask(mask_path: Path) -> np.ndarray | None:
     """
     Read VOC SegmentationObject mask as a 2D indexed array.
 
-    Original VOC masks are palette PNGs. PIL preserves the indexed values.
+    Original VOC masks are palette PNGs.
+    PIL preserves indexed values correctly.
     RGB fallback is included for dataset mirrors that saved masks as color images.
     """
     try:
@@ -93,7 +110,10 @@ def read_voc_index_mask(mask_path: Path) -> np.ndarray | None:
         arr = arr[:, :, :3]
 
         # If RGB channels are equal, it is effectively grayscale.
-        if np.array_equal(arr[:, :, 0], arr[:, :, 1]) and np.array_equal(arr[:, :, 0], arr[:, :, 2]):
+        if (
+            np.array_equal(arr[:, :, 0], arr[:, :, 1])
+            and np.array_equal(arr[:, :, 0], arr[:, :, 2])
+        ):
             return arr[:, :, 0]
 
         # RGB VOC-color fallback.
@@ -102,6 +122,7 @@ def read_voc_index_mask(mask_path: Path) -> np.ndarray | None:
         out = np.full((flat.shape[0],), 255, dtype=np.uint8)
 
         unique_colors = np.unique(flat, axis=0)
+
         for color in unique_colors:
             idx = VOC_COLOR_TO_INDEX.get(tuple(color.tolist()), 255)
             matches = np.all(flat == color, axis=1)
@@ -118,10 +139,11 @@ def read_voc_index_mask(mask_path: Path) -> np.ndarray | None:
 
 def get_image_objects(xml_path: Path) -> list[str]:
     """
-    Parse a VOC XML annotation and return object class names in XML order.
+    Parse VOC XML annotation and return object class names in XML order.
 
-    For VOC SegmentationObject masks, instance_id=1 generally maps to the first
-    XML object, instance_id=2 to the second object, and so on.
+    For VOC SegmentationObject masks:
+    instance_id=1 generally maps to the first XML object,
+    instance_id=2 to the second object, and so on.
     """
     objects = []
 
@@ -134,6 +156,7 @@ def get_image_objects(xml_path: Path) -> list[str]:
 
         for obj in root.findall("object"):
             cls_obj = obj.find("name")
+
             if cls_obj is not None and cls_obj.text:
                 objects.append(cls_obj.text.strip())
 
@@ -146,6 +169,7 @@ def get_image_objects(xml_path: Path) -> list[str]:
 def get_target_set(objects: list[str]) -> set[str]:
     if not TARGET_CLASSES:
         return set(objects)
+
     return {c for c in objects if c in TARGET_CLASSES}
 
 
@@ -170,7 +194,12 @@ def names_for_yaml() -> dict[int, str]:
 # POLYGON CONVERSION
 # ============================================================
 
-def mask_to_polygons(mask_path: Path, img_w: int, img_h: int, object_names: list[str]):
+def mask_to_polygons(
+    mask_path: Path,
+    img_w: int,
+    img_h: int,
+    object_names: list[str],
+):
     """
     Convert VOC SegmentationObject mask to YOLO polygon labels.
 
@@ -213,6 +242,7 @@ def mask_to_polygons(mask_path: Path, img_w: int, img_h: int, object_names: list
             continue
 
         class_id = class_id_for_name(class_name)
+
         if class_id is None:
             skipped_non_target += 1
             continue
@@ -245,40 +275,44 @@ def mask_to_polygons(mask_path: Path, img_w: int, img_h: int, object_names: list
                 continue
 
             pts = pts.astype(np.float32)
+
             pts[:, 0] /= img_w
             pts[:, 1] /= img_h
+
             pts = np.clip(pts, 0.0, 1.0)
 
             coords = " ".join(f"{p[0]:.6f} {p[1]:.6f}" for p in pts)
+
             yolo_lines.append(f"{class_id} {coords}")
 
     if not yolo_lines:
         if skipped_non_target > 0:
             return [], "no_target_polygons"
+
         if skipped_unmapped > 0:
             return [], "unmapped_instances"
+
         return [], "no_valid_polygons"
 
     return yolo_lines, None
 
 
 # ============================================================
-# TRAIN BALANCING
+# TRAIN BALANCING / UPSAMPLING
 # ============================================================
 
-def apply_train_balancing(train_ids: list[str], id_to_targets: dict[str, set[str]]) -> list[str]:
+def apply_train_balancing(
+    train_ids: list[str],
+    id_to_targets: dict[str, set[str]],
+) -> list[str]:
     """
-    Downsample only person-only train images.
+    Optional downsampling for person-only train images.
 
-    This keeps useful co-occurrence images like:
-    - person + chair
-    - person + car
-    - person + dog
-    - person + bottle
-
-    Val/test are never balanced, to keep evaluation natural and fair.
+    Currently disabled by default:
+    BALANCE_PERSON_ONLY_TRAIN = False
     """
     if not BALANCE_PERSON_ONLY_TRAIN:
+        print("ℹ️ Train person-downsampling disabled. Keeping all matching train images.")
         return train_ids
 
     if "person" not in TARGET_CLASSES or len(TARGET_CLASSES) <= 1:
@@ -286,6 +320,7 @@ def apply_train_balancing(train_ids: list[str], id_to_targets: dict[str, set[str
         return train_ids
 
     rng = random.Random(RANDOM_STATE)
+
     balanced = []
     dropped = 0
 
@@ -307,11 +342,36 @@ def apply_train_balancing(train_ids: list[str], id_to_targets: dict[str, set[str
     return balanced
 
 
+def get_upsample_factor(img_id: str, id_to_targets: dict[str, set[str]]) -> int:
+    """
+    Return duplication factor for a training image.
+
+    If image has multiple target classes, use the maximum factor.
+    Example:
+    targets = {"person", "bottle"} -> factor 3
+    """
+    if not UPSAMPLE_RARE_CLASSES:
+        return 1
+
+    targets = id_to_targets.get(img_id, set())
+
+    if not targets:
+        return 1
+
+    factor = 1
+
+    for cls in targets:
+        factor = max(factor, CLASS_UPSAMPLE_FACTORS.get(cls, 1))
+
+    return max(1, factor)
+
+
 # ============================================================
 # MAIN
 # ============================================================
 
 def main():
+    print(f"📂 Project root: {ROOT.resolve()}")
     print(f"📂 Scanning VOC Dataset at: {VOC_ROOT.resolve()}")
 
     mask_dir = VOC_ROOT / "SegmentationObject"
@@ -344,12 +404,15 @@ def main():
     ]:
         (OUT_DIR / sub).mkdir(parents=True, exist_ok=True)
 
+    # Prefer VOC official segmentation split.
     id_list_path = VOC_ROOT / "ImageSets" / "Segmentation" / "trainval.txt"
 
     if id_list_path.exists():
+        print(f"✅ Using official segmentation split: {id_list_path}")
         with open(id_list_path, "r", encoding="utf-8") as f:
             all_ids = [line.strip() for line in f if line.strip()]
     else:
+        print("⚠️ ImageSets/Segmentation/trainval.txt not found. Scanning SegmentationObject masks.")
         all_ids = sorted(f.stem for f in mask_dir.glob("*.png"))
 
     stats = Counter()
@@ -376,8 +439,9 @@ def main():
 
     stats["target_filtered"] = len(valid_ids)
 
-    print(f"✅ Target classes: {TARGET_CLASSES}")
-    print(f"✅ Matching images: {len(valid_ids)}")
+    print(f"\n✅ Target classes: {TARGET_CLASSES}")
+    print(f"✅ Total scanned segmentation IDs: {len(all_ids)}")
+    print(f"✅ Matching images after class filter: {len(valid_ids)}")
     print(f"🏷️ YAML names: {names_for_yaml()}")
 
     if not valid_ids:
@@ -420,8 +484,14 @@ def main():
 
         print(f"   {split_name:5s}: {dict(class_counter)}")
 
+    print("\n📊 Upsampling config:")
+    print(f"   UPSAMPLE_RARE_CLASSES: {UPSAMPLE_RARE_CLASSES}")
+    print(f"   CLASS_UPSAMPLE_FACTORS: {CLASS_UPSAMPLE_FACTORS}")
+    print("   Applies to train split only.")
+
+    # Process splits
     for split_name, ids in splits.items():
-        print(f"\n⏳ Processing {split_name} split ({len(ids)} images)...")
+        print(f"\n⏳ Processing {split_name} split ({len(ids)} base images)...")
 
         split_img_dir = OUT_DIR / "images" / split_name
         split_lbl_dir = OUT_DIR / "labels" / split_name
@@ -432,16 +502,20 @@ def main():
 
             if not src_img.exists() or not src_mask.exists():
                 stats["skipped_read_error"] += 1
+
                 if len(error_samples["read_error"]) < 5:
                     error_samples["read_error"].append(img_id)
+
                 continue
 
             img = cv2.imread(str(src_img), cv2.IMREAD_COLOR)
 
             if img is None:
                 stats["skipped_read_error"] += 1
+
                 if len(error_samples["read_error"]) < 5:
                     error_samples["read_error"].append(img_id)
+
                 continue
 
             h, w = img.shape[:2]
@@ -453,20 +527,33 @@ def main():
                 id_to_objects.get(img_id, []),
             )
 
-            if polygons:
-                shutil.copy2(src_img, split_img_dir / f"{img_id}.jpg")
-
-                with open(split_lbl_dir / f"{img_id}.txt", "w", encoding="utf-8") as f:
-                    f.write("\n".join(polygons))
-
-                stats["processed"] += 1
-
-            else:
+            if not polygons:
                 error = error or "unknown"
                 stats[f"skipped_{error}"] += 1
 
                 if len(error_samples[error]) < 5:
                     error_samples[error].append(img_id)
+
+                continue
+
+            # Upsampling is train-only.
+            factor = get_upsample_factor(img_id, id_to_targets) if split_name == "train" else 1
+
+            for dup_idx in range(factor):
+                if dup_idx == 0:
+                    out_id = img_id
+                else:
+                    out_id = f"{img_id}_dup{dup_idx}"
+
+                shutil.copy2(src_img, split_img_dir / f"{out_id}.jpg")
+
+                with open(split_lbl_dir / f"{out_id}.txt", "w", encoding="utf-8") as f:
+                    f.write("\n".join(polygons))
+
+                stats["processed"] += 1
+
+                if split_name == "train" and dup_idx > 0:
+                    stats["train_upsampled_duplicates"] += 1
 
     yaml_path = OUT_DIR / "data.yaml"
 
@@ -488,37 +575,50 @@ def main():
 
     assert yaml_path.exists(), f"data.yaml was not created at {yaml_path}"
 
-    print("\n" + "=" * 50)
+    # Count final generated files
+    final_train_images = len(list((OUT_DIR / "images" / "train").glob("*.jpg")))
+    final_val_images = len(list((OUT_DIR / "images" / "val").glob("*.jpg")))
+    final_test_images = len(list((OUT_DIR / "images" / "test").glob("*.jpg")))
+
+    print("\n" + "=" * 60)
     print("📊 PREPROCESSING STATISTICS")
-    print("=" * 50)
-    print(f"Total scanned              : {stats['total_scanned']}")
-    print(f"Filtered target images      : {stats['target_filtered']}")
-    print(f"Successfully processed      : {stats['processed']}")
-    print("-" * 50)
-    print(f"Split train IDs             : {len(train_ids)}")
-    print(f"Split val IDs               : {len(val_ids)}")
-    print(f"Split test IDs              : {len(test_ids)}")
-    print("-" * 50)
+    print("=" * 60)
+    print(f"Total scanned segmentation IDs : {stats['total_scanned']}")
+    print(f"Filtered target images         : {stats['target_filtered']}")
+    print(f"Successfully written samples   : {stats['processed']}")
+    print(f"Train upsample duplicates      : {stats['train_upsampled_duplicates']}")
+    print("-" * 60)
+    print(f"Base split train IDs           : {len(train_ids)}")
+    print(f"Base split val IDs             : {len(val_ids)}")
+    print(f"Base split test IDs            : {len(test_ids)}")
+    print("-" * 60)
+    print(f"Final train images after upsample: {final_train_images}")
+    print(f"Final val images                 : {final_val_images}")
+    print(f"Final test images                : {final_test_images}")
+    print("-" * 60)
 
     skipped_keys = sorted(k for k in stats if k.startswith("skipped_"))
 
     if skipped_keys:
         print("Skipped summary:")
+
         for key in skipped_keys:
             print(f"  {key.replace('skipped_', ''):24s}: {stats[key]}")
     else:
-        print("Skipped summary             : none")
+        print("Skipped summary                : none")
 
     if error_samples:
         print("\nSample problematic IDs:")
+
         for err, ids in error_samples.items():
             print(f"  {err:24s}: {', '.join(ids)}")
 
-    print("-" * 50)
-    print(f"📦 Dataset root             : {OUT_DIR.resolve()}")
-    print(f"✅ data.yaml saved at        : {yaml_path}")
-    print(f"🏷️ YAML names               : {names_for_yaml()}")
-    print("\n🚀 5-class preprocessing complete. Run training with: python train.py")
+    print("-" * 60)
+    print(f"📦 Dataset root                : {OUT_DIR.resolve()}")
+    print(f"✅ data.yaml saved at           : {yaml_path}")
+    print(f"🏷️ YAML names                  : {names_for_yaml()}")
+    print("\n🚀 5-class preprocessing with rare-class upsampling complete.")
+    print("Run training with: python train.py")
 
 
 if __name__ == "__main__":

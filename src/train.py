@@ -14,32 +14,27 @@ from ultralytics import YOLO
 ROOT = Path(__file__).resolve().parent.parent
 DATA_YAML = ROOT / "output" / "dataset" / "data.yaml"
 
-# RTX 3080 recommended setup.
-# If VRAM is not enough, switch to yolov8s-seg.pt.
-MODEL_VARIANT = "yolov8m-seg.pt"
+# YOLO26 segmentation experiment.
+# Requires a recent Ultralytics version:
+# pip install -U ultralytics
+MODEL_VARIANT = "yolo26m-seg.pt"
 
-# Stronger training for 5-class segmentation.
 EPOCHS = 250
 PATIENCE = 60
 
-# Higher resolution improves mask boundaries and small objects.
-# If it is too slow/OOM, reduce to 768.
 IMG_SIZE = 896
 
-# Dynamic batch fallback.
-# The script tries the largest batch first, then retries smaller batches on CUDA OOM.
 BATCH_CANDIDATES = [16, 12, 8, 4]
 
 WORKERS = 8
 DEVICE = 0
 
-# For 16GB system RAM, disk cache is safer than RAM cache.
-# If your friend has lots of free RAM and GPU utilization drops, try "ram".
+# For 16GB RAM, disk cache is safer.
+# If RAM is high and GPU utilization drops, try "ram".
 CACHE_MODE = "disk"
 
-RUN_NAME = "voc2012_5class_rtx3080_yolov8m_img896"
+RUN_NAME = "voc2012_5class_yolo26m_seg_img896_upsample"
 
-# Quality watcher thresholds.
 QUALITY_MIN_EPOCH = 40
 QUALITY_PATIENCE = 15
 MIN_MASK_MAP5095 = 0.20
@@ -51,7 +46,6 @@ MIN_MASK_RECALL = 0.35
 # ============================================================
 
 def get_metric(results_dict: dict, candidates: list[str]) -> float:
-    """Handle small naming differences across Ultralytics versions."""
     for key in candidates:
         if key in results_dict:
             return float(results_dict[key])
@@ -68,16 +62,6 @@ def safe_array(value):
 
 
 def extract_per_class_mask_metrics(metrics) -> list[dict]:
-    """
-    Extract per-class segmentation metrics from Ultralytics validation results.
-
-    Common SegmentMetrics structure:
-    metrics.seg.p
-    metrics.seg.r
-    metrics.seg.ap50
-    metrics.seg.ap
-    metrics.seg.maps
-    """
     names = getattr(metrics, "names", {}) or {}
     seg = getattr(metrics, "seg", None)
 
@@ -181,13 +165,6 @@ def print_per_class_metrics(rows: list[dict]):
 # ============================================================
 
 class QualityWatchCallback:
-    """
-    Watches validation mask metrics during training.
-
-    It does not mutate training parameters mid-run.
-    It only saves recommendation files if results are weak or plateaued.
-    """
-
     def __init__(
         self,
         min_epoch: int,
@@ -253,12 +230,12 @@ class QualityWatchCallback:
             "best_mask_mAP50_95_seen": self.best_map,
             "reason": "weak_metrics" if clearly_weak else "plateau",
             "recommended_next_edits": [
+                "If YOLO26 gives an error, update Ultralytics with: pip install -U ultralytics.",
+                "If YOLO26m-seg is too heavy, try yolo26s-seg.pt.",
                 "If RTX 3080 OOM happens often, reduce IMG_SIZE to 768.",
-                "If training is stable but recall is weak, test mosaic=0.0 for one run.",
-                "If mAP50 is good but mAP50-95 is weak, keep high IMG_SIZE and train longer.",
-                "If class imbalance hurts person/chair/car metrics, tune PERSON_ONLY_KEEP_RATIO in preprocessing.",
-                "If yolov8m-seg is too slow, use yolov8s-seg for faster iteration.",
-                "If results plateau early, try freeze=10 for a separate fine-tuning experiment.",
+                "If recall is weak, test mosaic=0.0 for one run.",
+                "If bottle/chair still underperform, increase their upsample factors in preprocessing.",
+                "If YOLO26 underperforms YOLOv8m, keep YOLOv8m as the baseline.",
             ],
         }
 
@@ -327,13 +304,8 @@ def print_gpu_status():
 # ============================================================
 
 def train_once(batch_size: int):
-    """
-    Train one run with a specific batch size.
-
-    If CUDA OOM happens, the outer loop catches it and retries with a smaller batch.
-    """
     print("\n" + "=" * 64)
-    print(f"🚀 Starting training attempt with batch={batch_size}, imgsz={IMG_SIZE}")
+    print(f"🚀 Starting YOLO26 training attempt with batch={batch_size}, imgsz={IMG_SIZE}")
     print("=" * 64)
 
     model = YOLO(MODEL_VARIANT)
@@ -361,7 +333,6 @@ def train_once(batch_size: int):
         amp=True,
         cache=CACHE_MODE,
 
-        # Fine-tuning optimization for pretrained YOLO segmentation.
         optimizer="AdamW",
         lr0=1e-4,
         lrf=0.01,
@@ -370,18 +341,15 @@ def train_once(batch_size: int):
         seed=42,
         deterministic=True,
 
-        # Controlled geometric augmentation.
         degrees=5.0,
         scale=0.4,
         fliplr=0.5,
 
-        # Segmentation-friendly augmentation.
         mosaic=0.1,
         mixup=0.0,
         copy_paste=0.25,
         close_mosaic=40,
 
-        # Output.
         project=str(ROOT / "output" / "runs"),
         name=run_name,
         exist_ok=True,
@@ -393,7 +361,6 @@ def train_once(batch_size: int):
 
 
 def train_with_dynamic_batch():
-    """Try large batch first, then retry smaller batches if CUDA OOM occurs."""
     last_error = None
 
     for batch_size in BATCH_CANDIDATES:
@@ -409,7 +376,6 @@ def train_with_dynamic_batch():
                 print("\n" + "!" * 72)
                 print(f"⚠️ CUDA OOM with batch={batch_size}. Retrying with smaller batch...")
                 print("!" * 72 + "\n")
-
                 cleanup_cuda()
                 continue
 
@@ -417,11 +383,9 @@ def train_with_dynamic_batch():
 
         except torch.cuda.OutOfMemoryError as e:
             last_error = e
-
             print("\n" + "!" * 72)
             print(f"⚠️ CUDA OOM with batch={batch_size}. Retrying with smaller batch...")
             print("!" * 72 + "\n")
-
             cleanup_cuda()
             continue
 
@@ -500,6 +464,7 @@ def evaluate_best_checkpoint(model, results, used_batch: int):
     )
 
     print("\n📈 FINAL TEST SEGMENTATION PERFORMANCE:")
+    print(f"   • Model         : {MODEL_VARIANT}")
     print(f"   • Used batch    : {used_batch}")
     print(f"   • Image size    : {IMG_SIZE}")
     print(f"   • Precision (M): {precision_m:.4f}")
@@ -512,24 +477,6 @@ def evaluate_best_checkpoint(model, results, used_batch: int):
 
     csv_path = save_per_class_metrics(per_class_rows, save_dir)
     print(f"\n✅ Per-class mask metrics saved to: {csv_path}")
-
-    if map5095_m < MIN_MASK_MAP5095 or recall_m < MIN_MASK_RECALL:
-        final_reco_path = save_dir / "final_low_score_recommendations.md"
-
-        with open(final_reco_path, "w", encoding="utf-8") as f:
-            f.write("# Final Low-Score Recommendations\n\n")
-            f.write(f"- Final test mAP50-95(M): {map5095_m:.4f}\n")
-            f.write(f"- Final test recall(M): {recall_m:.4f}\n")
-            f.write(f"- Used batch: {used_batch}\n")
-            f.write(f"- Image size: {IMG_SIZE}\n\n")
-            f.write("## Suggested next edits\n\n")
-            f.write("1. If training crashed before this run, reduce IMG_SIZE to 768.\n")
-            f.write("2. If recall is weak, try `mosaic=0.0`.\n")
-            f.write("3. If mAP50 is good but mAP50-95 is weak, train longer or keep high image size.\n")
-            f.write("4. If one class is much worse, inspect per-class prediction images.\n")
-            f.write("5. If person dominates again, tune PERSON_ONLY_KEEP_RATIO in preprocessing.\n")
-
-        print(f"⚠️ Low final score detected. Recommendations saved to: {final_reco_path}")
 
     print(f"\n📁 Results saved in: {save_dir}")
 
@@ -546,7 +493,7 @@ def main():
         return
 
     print("=" * 64)
-    print("🚀 YOLOv8-Seg RTX 3080 Dynamic Batch Training")
+    print("🚀 YOLO26-Seg 5-Class Dynamic Batch Training")
     print("=" * 64)
     print(f"Data YAML        : {DATA_YAML.resolve()}")
     print(f"Model            : {MODEL_VARIANT}")
