@@ -1,0 +1,21 @@
+# Ultralytics YOLOv8 and Computer Vision
+ultralytics==8.4.45
+opencv-python==4.13.0.92
+pillow==12.2.0
+
+# Deep Learning Framework
+torch==2.11.0
+torchvision==0.26.0
+
+# Data Science and Utilities
+numpy==2.4.4
+scipy==1.17.1
+scikit-learn  # Not explicitly in freeze but imported as sklearn.model_selection
+PyYAML==6.0.3
+tqdm==4.67.3
+
+# Core Dependencies (Transitive but listed for completeness)
+pydantic==2.13.3
+requests==2.33.1
+psutil==7.2.2
+matplotlib  # Often required by ultralytics for visualization
